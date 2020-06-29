@@ -1,0 +1,77 @@
+---
+title: "Common data processors"
+output: html_notebook
+---
+
+### Join all into one dataframe
+
+]Empty population data is filled from the previous months.
+
+```{r}
+data.joined <- mort %>%
+  union_all(pop, by = c("Date")) %>%
+  union_all(temp, by = c("Date")) %>%
+  union_all(air, by = c("Date")) %>%
+  mutate(
+    YearWeek = ISOweek::ISOweek(Date)
+  ) %>%
+  group_by(YearWeek) %>%
+  summarise(
+    Days = (max(Date) - min(Date) + 1) %>% as.numeric(units = "days"),
+    StartPeriod = min(Date),
+    Date = max(Date),
+    Deaths = sum(Deaths, na.rm = T),
+    Population = last(na.omit(Population), default = NA),
+    Temperature = mean(Temperature, na.rm = T),
+    PM2.5 = mean(PM2.5, na.rm = T),
+    PM10 = mean(PM10, na.rm = T),
+    NO2 = mean(NO2, na.rm = T),
+    O3 = mean(O3, na.rm = T)
+  ) %>%
+  filter(Date <= max(mort$Date)) %>%
+  arrange(desc(Date)) %>%
+  fill(Population, .direction = "downup") 
+
+data.joined
+```
+
+### Calculate the mortality rate
+
+We will calculate the mortality rate the deaths by 1,000,000 inhabitants.
+Additionally, we'll add columns for mortality rates in the previous 8 weeks.
+
+
+```{r}
+
+data <- data.joined %>%
+  mutate(MortalityRate = Deaths * 100000 / Population / Days * 7, # to normalise week 53 and 1 
+         Regio = "NL",
+         Interval = "week",
+         Period = str_match(YearWeek, "W(\\d+)") %>% .[,2] %>% as.numeric(),
+         Year = str_match(YearWeek, "(\\d{4})") %>% .[,2] %>% as.numeric(),
+         "MortalityRate.-1" = lag(MortalityRate, 1, order_by = Date),
+         "MortalityRate.-2" = lag(MortalityRate, 2, order_by = Date),
+         "MortalityRate.-3" = lag(MortalityRate, 3, order_by = Date),
+         "MortalityRate.-4" = lag(MortalityRate, 4, order_by = Date),
+         "MortalityRate.-5" = lag(MortalityRate, 5, order_by = Date),
+         "MortalityRate.-6" = lag(MortalityRate, 6, order_by = Date),
+         "MortalityRate.-7" = lag(MortalityRate, 7, order_by = Date),
+         "MortalityRate.-8" = lag(MortalityRate, 8, order_by = Date),
+         "MortalityRate.-9" = lag(MortalityRate, 5, order_by = Date),
+         "MortalityRate.-10" = lag(MortalityRate, 6, order_by = Date),
+         "MortalityRate.-11" = lag(MortalityRate, 7, order_by = Date),
+         "MortalityRate.-12" = lag(MortalityRate, 8, order_by = Date),
+        ) %>%
+  select(-Days, -StartPeriod, -YearWeek)
+data
+```
+
+### Save data
+
+```{r}
+write_rds(data, "../results/data.Rds")
+```
+
+```{r}
+data %>% group_by(year(Date)) %>% summarise(M = mean(MortalityRate)) %>% arrange(desc(M))
+```

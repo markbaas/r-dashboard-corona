@@ -1,0 +1,209 @@
+---
+title: "Air quality by area"
+output: html_notebook
+---
+
+```{r message=FALSE, warning=FALSE}
+options("rgdal_show_exportToProj4_warnings"="none")
+library(rgdal)
+library(tmaptools)
+library(sf)
+library(sp)
+library(tmap)
+library(httr)
+library(lubridate)
+library(tidyverse)
+library(stringr)
+require(raster)
+```
+
+
+### Get gemeente boundaries
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+areas <- GET("https://opendata.arcgis.com/datasets/e1f0dd70abcb4fceabbc43412e43ad4b_0.geojson") %>% content(as = "text") %>%
+  read_sf() %>%
+  rename(RegioS = Gemeentecode) %>%
+  select("RegioS")
+```
+
+### Get stations with coords.
+
+```{r}
+source("../../R/luchtmeetnet.R")
+
+air.stations <- luchtmeetnet_get_data("stations", params = list()) %>%
+  mutate(
+    Coords = number %>% map(function(x) luchtmeetnet_get_data("stations/{x}" %>% glue(), params = list())$geometry$coordinates),
+    Lat = Coords %>% map(first) %>% as.numeric(),
+    Lon = Coords %>% map(last) %>% as.numeric(),
+    Station = number
+  ) %>% 
+  st_as_sf(coords = c("Lat", "Lon")) %>%
+  st_set_crs(4326) %>%
+  st_join(areas)
+```
+
+#### Plot with locations
+
+```{r purl=F}
+tm_shape(areas) +
+  tm_borders() +
+  tm_shape(air.stations) +
+  tm_dots("red")
+```
+
+### Add missing data 
+
+```{r}
+air.historic <- read_rds("../../results/luchtmeetnet.Rds")
+
+# with no previous data this may take very very long. 
+need_more <- ymd(max(air.historic$Date) + 1) <  today()
+
+if (need_more) {
+  t1 = now()
+  dates <- seq(ymd(max(air.historic$Date) + 1), to = today(), by = "7 days")
+  
+  air.luchtmeetnet <- dates %>% map(function(startx)
+    luchtmeetnet_get_data("measurements", params = list(
+      start = format(startx, "%Y-%m-%dT%H:%M:%S"),
+      end = format(startx + duration(days = 6, hours = 23, minutes = 59), "%Y-%m-%dT%H:%M:%S")
+    ), verbose = TRUE)
+  ) %>% bind_rows()  
+  
+  t2 = now()
+  
+  air.daily <- air.luchtmeetnet %>% 
+    mutate(
+      Date = date(ymd_hms(timestamp_measured)),
+      Variable = if_else(formula == "PM25", "PM2.5", formula),
+      Station = station_number
+    ) %>%
+    group_by(Date, Station, Variable) %>%
+    summarise(
+      Value = mean(value)
+    ) %>% ungroup() %>%
+    union_all(air.historic) %>% distinct() %>% arrange(Date)
+  
+  write_rds(air.daily, "../../results/luchtmeetnet.Rds")
+} else {
+  air.daily <- air.historic
+}
+
+head(air.daily)
+```
+
+#### Sample table
+
+```{r paged.print=TRUE}
+air.daily
+```
+
+### Aggregate by Week
+
+```{r}
+air.weekly <- air.daily %>%
+  left_join(air.stations) %>%
+  mutate(
+    Year = year(Date),
+    Month = month(Date),
+    Week = ISOweek::ISOweek(Date),
+  ) %>%
+  group_by(Week, Station, Variable) %>%
+  summarise(
+    Value = mean(Value),
+  ) %>%
+  ungroup() %>%
+  filter(Variable %in% c("PM10", "PM2.5", "NO2", "O3"))
+
+air.weekly
+```
+
+### Transform all to planar and with km as units
+
+```{r}
+crs.grid <- "+proj=aea +lat_0=0 +lon_0=0 +lat_1=29.5 +lat_2=42.5 +x_0=0 +y_0=0 +ellps=GRS80 +units=km +no_defs +datum=WGS84"
+
+areas.planar <- areas %>% st_transform(crs.grid)
+air.planar <- air.stations %>% left_join(air.weekly)  %>% st_transform(crs.grid)
+```
+
+### Create grid
+
+```{r}
+grid <- raster::raster()
+raster::extent(grid) <- raster::extent(areas.planar)
+raster::res(grid) <- 1 # 5 km
+raster::projection(grid) <- raster::crs(areas.planar)
+```
+
+### Interpolate
+
+Different methods have been compared. The best is probably ordinary Kriging. Nevertheless, Inverted Distance Weights resulted a bit more faster and simpler approach.
+
+```{r echo=FALSE, warning=FALSE}
+interpolate_idw <- function(locations) {
+  idm <- gstat::gstat(formula = Value ~ 1, locations = locations %>% st_as_sf())
+  capture.output(idp <- raster::interpolate(grid, idm) %>% raster::mask(areas.planar))
+
+  values <- tabularaster::cellnumbers(idp, areas.planar) %>% 
+    mutate(v = raster::extract(idp, cell_)) %>% 
+    group_by(object_) %>% summarise(Value = mean(v)) %>% pull(Value)
+  
+  return (areas.planar %>% mutate(
+    Value = values,
+    Week = first(locations$Week),
+    Variable = first(locations$Variable)
+  ))
+}
+
+plan(multiprocess)
+
+air.interpolated <- air.planar %>% drop_na(Week, Value) %>% 
+  select(-location, -number, -Coords, -Station, -RegioS) %>% as.data.frame() %>% 
+  group_by(Week, Variable) %>% group_split() %>%
+  future_map(interpolate_idw, .options = future_options(packages = c("sf"))) %>%
+  bind_rows() %>% as.data.frame() %>% select(-geometry)
+
+head(air.interpolated)
+```
+
+#### Example result
+
+```{r purl=F}
+tm_shape(air.interpolated %>% filter(Week == "2017-W10") %>% left_join(areas) %>% st_as_sf()) +
+  tm_borders(col = "#fff1d5") +
+  tm_fill(col = "Value") +
+  tm_facets(by = "Variable")
+```
+
+### Add NL
+
+```{r}
+air.nl <- air.daily %>%
+  mutate(
+    Week = ISOweek::ISOweek(Date),
+  ) %>%
+  group_by(Week, Variable) %>%
+  summarise(
+    Value = mean(Value),
+  ) %>%
+  ungroup() %>%
+  filter(Variable %in% c("PM10", "PM2.5", "NO2", "O3")) %>%
+  mutate(
+    RegioS = "NL"
+  )
+
+head(air.nl)
+```
+
+```{r}
+air <- union_all(air.nl, air.interpolated) %>% spread(Variable, Value)
+```
+#### Write results
+
+```{r}
+write_rds(air, "../../results/air.Rds")
+```
+

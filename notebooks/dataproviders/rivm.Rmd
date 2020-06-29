@@ -1,0 +1,78 @@
+---
+title: "Official RIVM numbers"
+output: html_notebook
+---
+
+```{r}
+library(rvest)
+library(stringr)
+```
+
+### Mortality stats
+
+Stats for region NL are by week, so we aggregate them.
+
+```{r}
+script <- read_html("https://www.rivm.nl/coronavirus-covid-19/grafieken") %>%
+  html_node(xpath = "//script[contains(text(), \"462501-0-field_par_chart\")]/text()") %>%
+  html_text() %>%
+  jsonlite::fromJSON()
+
+months <- seq(1:12) %>% set_names(c("jan", "feb", "mrt", "apr", "mei", "jun", "jul", "aug", "sep", "okt", "nov", "dec"))
+data.rivm.daily <- (script$easychart$`462501-0-field_par_chart`$csv) %>%
+  str_match_all(., "\\[\"([^\"]*)\",\"([^\"]*)\",\"([^\"]*)\"\\]") %>%
+  .[[1]] %>% .[,2:4] %>% as.data.frame() %>% .[-1, ] %>% select("V1", "V3") %>%
+  set_names("Date", "Deaths") %>% mutate(
+    Day = str_match(Date, "(\\d+) \\w{3}") %>% .[,2] %>% as.numeric(),
+    Month = str_match(Date, "\\d+ (\\w{3})") %>% .[,2] %>% map(~ months[.x]) %>% as.numeric(),
+    Date = date(ISOdate(2020, Month, Day)),
+    Deaths = as.numeric(Deaths),
+    # Period = isoweek(Date)
+  ) %>% mutate(
+    Regio = "NL"
+  ) %>% select(-Day, -Month)
+
+data.rivm.nl <- data.rivm.daily %>% mutate(
+  Period = isoweek(Date)
+  ) %>% group_by(Period) %>%
+  summarise(
+    Deaths = sum(Deaths),
+    Regio = first(Regio),
+    Date = last(Date)
+  ) %>% select(-Period)
+
+data.rivm.nl
+```
+
+### Regional stats
+
+Scrapes the csv file from the covid-19 page of the RIVM.
+As the cbs mortality numbers are by month, unfortunately these data will be aggregated by month.
+
+```{r}
+data.rivm.spatial <- read_html("https://www.rivm.nl/coronavirus-covid-19/actueel") %>%
+  html_nodes("#csvData") %>% html_text() %>% read.csv(sep = ";", text = ., dec = ",") %>%
+  mutate(
+    Regio = paste0("GM", str_pad(Gemnr, 4, pad = "0")),
+    Date = dmy(tot_datum),
+    # Period = month(Date),
+    Deaths = Overleden_Absoluut
+  ) %>% select(Regio, Date, Deaths)
+# %>% 
+#   group_by(Regio, Period) %>% 
+#   summarise(
+#     Deaths = sum(Deaths),
+#     Date = max(Date),
+#   ) %>% mutate(Interval = "month")
+
+data.rivm.spatial %>% filter(Regio == "GM0345")
+```
+
+### Join datasets
+
+```{r}
+data.rivm <- union_all(data.rivm.nl, data.rivm.spatial)
+
+write_rds(data.rivm, "../../results/rivm.Rds")
+```
+

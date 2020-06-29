@@ -1,0 +1,112 @@
+---
+title: "Training the model"
+output: html_notebook
+params:
+  # data: "data.spatial"
+  data: "data"
+---
+
+In this notebook we train our model based on previous years. The code supports both the spatial dataset as the regular.
+
+```{r include=FALSE}
+library(tidyverse)
+library(lubridate)
+library(caret)
+library(ggpubr)
+library(glue)
+library(parallel)
+library(doParallel)
+```
+
+### Read data
+
+```{r}
+data <- read_rds("../results/{params$data}.Rds" %>% glue())
+head(data)
+```
+
+### Plot correlations
+
+```{r message=FALSE, warning=FALSE, echo=T, purl=FALSE}
+
+mcols <- names(data) %>% discard(~ !str_detect(.x, "^MortalityRate\\."))
+cols <- c("Temperature", "PopElder", "PM2.5", "PM10", "NO2", "O3", "RegioS", mcols)
+# cols <- c("Temperature", "PM2.5", mcols)
+pcols <- c("MortalityRate.-5", "MortalityRate.-6", "MortalityRate.-7", "MortalityRate.-8", "Temperature",  "PM2.5", "NO2", "PopElder")
+pdata <- gather(data %>% filter(RegioS == "NL"), "Var", "Value", pcols) 
+
+data %>% filter(RegioS == "GM0345" &`MortalityRate.-1` < 0)
+pdata %>% filter(Var == "MortalityRate.-1" & Value < 0)
+
+ggplot(data = pdata, aes(Value, MortalityRate, group = Var)) +
+  geom_point() +
+  geom_smooth(method = lm) +
+  stat_cor(method = "pearson", label.x = 0, label.y = 0, size=3, vjust = -0.1) +
+  facet_wrap( ~ Var, scales = "free")
+
+ggplot(data = data %>% filter(RegioS == "NL" & Date > ISOdate(2018, 10, 1)), aes(Date, `MortalityRate.-1`)) +
+  geom_line() + 
+  geom_point()
+```
+
+### Prepare training data
+
+```{r}
+data_train <- data %>%
+  filter(year(Date) < 2020 & RegioS == "NL") %>%
+  select(c("MortalityRate", cols)) %>%
+  as.data.frame()
+
+data_train.spatial <- data %>% filter(year(Date) < 2020 & RegioS != "NL") %>%
+  select(c("MortalityRate", cols)) %>% 
+  as.data.frame() %>% 
+  mutate(Id = row_number()) %>%
+  gather(Var, Value, -RegioS, -Id) %>%
+  mutate(Value = round(Value, 2)) %>%
+  spread(Var, Value) %>% select(-Id)
+data_train.spatial
+```
+
+### Train the model
+
+```{r}
+cluster <- makeCluster(detectCores() - 1) # convention to leave 1 core for OS
+registerDoParallel(cluster)
+
+fitControl <- trainControl(method = "repeatedcv", number = 50, repeats = 20, search = "random", allowParallel = F, verboseIter = F)
+fitControl2 <- trainControl(method = "repeatedcv", number = 10, repeats = 10, search = "random", allowParallel = F, verboseIter = F)
+
+tic()
+model.cv <- train(
+  MortalityRate ~ ., 
+  data = data_train %>% select_if(~ length(unique(.)) > 1), 
+  method = "lasso", 
+  trControl = fitControl, 
+  na.action = na.omit, 
+  # preProcess = c('scale', 'center')
+)
+toc()
+
+tic()
+model.spatial <- train(
+  MortalityRate ~ ., 
+  data = data_train.spatial %>% select_if(~ length(unique(.)) > 1), 
+  method = "lasso", 
+  trControl = fitControl2, 
+  na.action = na.omit, 
+  # preProcess = c('scale', 'center')
+)
+toc()
+model.spatial
+
+stopCluster(cluster)
+
+model.spatial
+model.cv
+```
+
+### Save the model
+
+```{r include=FALSE}
+write_rds(list("NL" = model.cv, "GM" = model.spatial), "../results/model.Rds")
+```

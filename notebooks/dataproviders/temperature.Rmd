@@ -1,0 +1,148 @@
+---
+title: "Constructs geographica dataset for temperature data by town"
+output: 
+  html_notebook
+---
+
+```{r message=FALSE, warning=FALSE}
+options("rgdal_show_exportToProj4_warnings"="none")
+library(rgdal)
+library(lubridate)
+library(sf)
+library(sp)
+library(tidyverse)
+library(tmap)
+
+source("../../R/knmi.R")
+```
+
+### Get gemeente boundaries
+
+```{r}
+areas <- GET("https://opendata.arcgis.com/datasets/e1f0dd70abcb4fceabbc43412e43ad4b_0.geojson") %>% content(as = "text") %>%
+  read_sf() %>%
+  rename(RegioS = Gemeentecode) %>%
+  select("RegioS")
+```
+
+### Get Maximum Temperature data from KNMI
+
+```{r}
+temp.daily <- knmi_get_data(
+    start = "20020101",
+    end = strftime(today(), format = "%Y%m%d"),
+    vars = "TX",
+    stns = "ALL"
+  ) %>%
+  drop_na() %>%
+  mutate(Date = ymd(Date),
+         Week = ISOweek::ISOweek(Date))
+
+temp.geo <- temp.daily %>%
+  group_by(Week, Station) %>%
+  summarise(
+    MaxTemperature = max(Temperature) / 10, 
+    AvgTemperature = mean(Temperature) / 10,
+    Lat = first(Lat), Lon = first(Lon)
+  ) %>%
+  ungroup() %>%
+  st_as_sf(coords = c("Lat", "Lon")) %>%
+  st_set_crs(4326)
+```
+
+#### Plot
+
+```{r purl=F}
+tm_shape(areas) +
+  tm_borders() +
+tm_shape(temp.geo %>% filter(Week == "2014-W01")) +
+  tm_dots(size = "MaxTemperature", col = "AvgTemperature")
+```
+
+### Transform all to planar and with km as units
+
+```{r}
+crs.grid <- "+proj=aea +lat_0=0 +lon_0=0 +lat_1=29.5 +lat_2=42.5 +x_0=0 +y_0=0 +ellps=GRS80 +units=km +no_defs +datum=WGS84"
+
+areas.planar <- areas %>% st_transform(crs.grid)
+temp.planar <- temp.geo %>% gather("Variable", "Value", MaxTemperature, AvgTemperature) %>% st_transform(crs.grid)
+```
+
+### Create grid
+
+```{r}
+grid <- raster::raster()
+raster::extent(grid) <- raster::extent(areas.planar)
+raster::res(grid) <- 1 # 1 km
+raster::projection(grid) <- raster::crs(areas.planar)
+```
+
+### Interpolate
+
+Different methods have been compared. The best is probably ordinary Kriging. Nevertheless, Inverted Distance Weights resulted a bit more faster and simpler approach.
+
+```{r echo=FALSE, warning=FALSE}
+interpolate_idw <- function(locations) {
+  idm <- gstat::gstat(formula = Value ~ 1, locations = locations %>% st_as_sf())
+  capture.output(idp <- raster::interpolate(grid, idm) %>% raster::mask(areas.planar))
+
+  values <- tabularaster::cellnumbers(idp, areas.planar) %>% 
+    mutate(v = raster::extract(idp, cell_)) %>% 
+    group_by(object_) %>% summarise(Value = mean(v)) %>% pull(Value)
+  
+  return (areas.planar %>% mutate(
+    Value = values,
+    Week = first(locations$Week),
+    Variable = first(locations$Variable)
+  ))
+}
+
+plan(multiprocess)
+
+temp.interpolated <- temp.planar %>% drop_na(Week, Value) %>% 
+  select(-Station) %>% as.data.frame() %>% 
+  group_by(Week, Variable) %>% group_split() %>%
+  future_map(interpolate_idw, .options = future_options(packages = c("sf"))) %>%
+  bind_rows() %>% as.data.frame() %>% select(-geometry)
+
+head(temp.interpolated)
+```
+
+#### Example plot
+
+```{r purl=F}
+tm_shape(temp.interpolated %>% filter(Week == "2015-W01") %>% left_join(areas) %>% st_as_sf()) +
+  tm_borders(col = "#fff1d5") +
+  tm_fill(col = "Value") +
+  tm_facets(by = "Variable") +
+tm_shape(temp.geo %>% filter(Week == "2015-W01") %>% mutate(AvgTemperature = round(AvgTemperature))) +
+  tm_text("AvgTemperature", size = 0.8)
+```
+### Add NL
+
+```{r}
+temp.nl <- temp.daily %>%
+  group_by(Week) %>%
+  summarise(
+    MaxTemperature = max(Temperature) / 10
+  ) %>%
+  mutate(
+    RegioS = "NL"
+  )
+
+head(temp.nl)
+```
+
+```{r}
+temp <- union_all(
+  temp.nl, 
+  temp.interpolated %>% filter(Variable == "MaxTemperature") %>% spread(Variable, Value)
+) %>% select(Week, RegioS, Temperature = MaxTemperature)
+```
+
+
+### Write results
+
+```{r}
+write_rds(temp, "../../results/temperature.Rds")
+```

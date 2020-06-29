@@ -1,0 +1,110 @@
+---
+title: "Add predictions"
+output: html_notebook
+params:
+  data: "data"
+  # data: "data.spatial"
+---
+
+```{r message=FALSE, warning=FALSE}
+library(tidyverse)
+library(lubridate)
+library(glue)
+```
+
+### Load data
+
+```{r}
+data <- read_rds("../results/data.Rds" %>% glue())
+model <- read_rds("../results/model.Rds" %>% glue())
+
+model$GM
+```
+Add lat lon to data
+
+```{r}
+areas <- GET("https://opendata.arcgis.com/datasets/e1f0dd70abcb4fceabbc43412e43ad4b_0.geojson") %>% content(as = "text") %>%
+  read_sf() %>%
+  rename(RegioS = Gemeentecode) %>% 
+  arrange(Gemeentenaam) %>% mutate(
+    Center = st_centroid(geometry),
+    Lon = st_coordinates(Center)[,"X"],
+    Lat = st_coordinates(Center)[, "Y"]
+  ) %>% st_drop_geometry() %>% select("RegioS", "Lon", "Lat") 
+
+```
+
+###  Plot different years/categories
+
+```{r purl=FALSE}
+
+
+data_avg <- data %>%
+  filter(year(Date) <= 2019) %>%
+  union_all(data %>% arrange(Date) %>% filter(Year <= 2019) %>% filter(Period == max(Period)) %>% mutate(Period = 0)) %>%
+  group_by(RegioS, Period) %>%
+  summarise(
+    AvgMortality = mean(MortalityRate)
+  ) %>% select(RegioS, Period, AvgMortality)
+
+
+data_cur.all <- data %>% filter(Year == 2020) %>% 
+  union_all(data %>% filter(Year == 2019) %>% filter(Period == max(Period)) %>% mutate(Period = 0))
+
+data_cur.nl <- data_cur.all %>% filter(RegioS == "NL") %>%
+  drop_na() %>%
+  mutate(
+    ExpectedMortality = predict(model$NL, .),
+    UnexpectedMortality = MortalityRate - ExpectedMortality,
+  )  %>% filter(RegioS == "NL")
+
+data_infl <- data %>%
+  filter(year(Date) == 2018) %>%
+  union_all(data %>% arrange(Date) %>% filter(Year == 2017) %>% filter(Period == max(Period)) %>% mutate(Period = 0)) %>%
+  rename(
+    Flu2018 = MortalityRate
+  ) %>% select(RegioS, Period, Flu2018)
+
+
+data.corona <- data_cur %>%
+  left_join(data_avg, by = c("Period", "RegioS")) %>%
+  left_join(data_infl, by = c("Period", "RegioS")) %>%
+  filter(Date <= max(data_cur$Date)) %>%
+  mutate(
+    ExcessiveMortality = MortalityRate - AvgMortality  
+  )
+
+pdata <- data.corona %>% filter(RegioS == "NL") %>%
+  gather(MortalityRate, Value, ExpectedMortality, AvgMortality, Flu2018, MortalityRate)
+
+
+ggplot(data=pdata, aes(x = Date, y = Value, group = MortalityRate, color = MortalityRate)) +
+  geom_line(aes(y = Value, group = MortalityRate, color = MortalityRate)) +
+  labs(x = "Periode", y = "Doden per miljoen inwoners")
+```
+
+```{r purl=FALSE}
+
+### Plot the unexpected deaths
+
+ggplot(data.corona %>% filter(RegioS == first(RegioS))) +
+  geom_area(aes(x = Period, y = UnexpectedMortality, fill = "Unexpected Mortality", group = 1)) +
+  scale_y_continuous(sec.axis = sec_axis(~./max(data.corona$UnexpectedMortality), name = "y2"))
+
+```
+
+### Totals until now
+
+```{r warning=FALSE, purl=FALSE}
+data.summary <- data.corona %>%
+  drop_na() %>%
+  summarize(
+    "ByPredictions" = sum(UnexpectedMortality),
+    "ByAverage" = sum(ExcessiveMortality)
+  ) %>% gather("Label", "Value", "ByPredictions", "ByAverage")
+data.summary
+```
+
+```{r include=FALSE}
+write_rds(data.corona, "../results/{params$data}.corona.Rds" %>% glue())
+```

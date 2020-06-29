@@ -1,0 +1,275 @@
+---
+title: "Spatial data pipeline"
+output: html_notebook
+---
+
+### Imports
+```{r message=FALSE, warning=TRUE}
+library(lubridate)
+library(cbsodataR)
+library(httr)
+library(aweek)
+library(glue)
+library(tidyverse)
+library(openxlsx)
+library(sf)
+library(fuzzyjoin)
+```
+
+### Get Population data from CBS
+
+```{r}
+pop.cbs <- cbs_get_data("37230NED") %>%
+  filter(
+    str_detect(Perioden, "\\d{4}MM\\d{2}") & 
+    str_detect(RegioS, "(GM\\d+)|(NL01)")
+  )
+
+pop.all <- pop.cbs %>%
+  mutate(
+    Year = Perioden %>% str_extract("\\d{4}") %>% as.numeric(),
+    Month = Perioden %>% str_match("\\d{4}MM(\\d{2})") %>% .[,2] %>% as.numeric(),
+    Deaths = Overledenen_3,
+    Population = BevolkingAanHetEindeVanDePeriode_15,
+    Date = ISOdate(Year, Month, 1),
+    Date = date(Date + duration(days = days_in_month(Date) - 1)),
+    RegioS = ifelse(str_detect(RegioS, "NL01"), "NL", RegioS)
+  ) %>%
+  select(Date, "Year", "Month", "RegioS", "Population", "Deaths") %>%
+  drop_na(Population) %>%
+  arrange(desc(Year), desc(Month))
+
+pop <- pop.all %>%
+  mutate(Week = ISOweek::ISOweek(Date)) %>%
+  group_by(RegioS, Week) %>%
+  summarise(
+    Population = last(Population)
+  )
+
+head(pop)
+```
+### Mortality
+
+#### Get NL mortality data from CBS
+
+```{r}
+
+cbs_to_isoweek <- function(x) x %>%
+  str_match("(\\d{4})[^J][0,1](\\d+)") %>% as.data.frame() %>% 
+  set_names(c("Input", "Year", "Week")) %>%
+  mutate(
+    Week = Week %>% as.numeric(),
+    Year = Year %>% as.numeric(),
+    YearWeek = case_when(
+      is.na(Week) ~ as.Date(NA),
+      Week == 0 ~ date(ISOdate(Year, 1, 1)),
+      Week == 1 ~ aweek::get_date(year = Year, week = 1),
+      TRUE ~ aweek::get_date(year = Year, week = pmax(1, Week))
+    ) %>% ISOweek::ISOweek() 
+  ) %>% pull(YearWeek)
+
+mort.nl <- cbs_get_data("70895NED") %>%
+  filter(
+    Geslacht == "1100" &
+    LeeftijdOp31December == "10000"
+  ) %>%
+  mutate(
+    YearWeek = cbs_to_isoweek(Perioden),
+  ) %>%
+  drop_na() %>%
+  group_by(YearWeek) %>%
+  summarise(
+    Deaths = sum(Overledenen_1),
+    Perioden = last(Perioden)
+  ) %>% mutate(
+    Year = str_match(YearWeek, "(\\d{4})") %>% .[,2] %>% as.numeric(),
+    Week = str_match(YearWeek, "W(\\d+)") %>% .[,2],
+    Date = aweek::get_date(year = Year, week = Week, day = 7),
+    RegioS = "NL"
+  ) %>% filter(Year >= 1995) %>% 
+  select(Date, RegioS, Deaths, Week = YearWeek)
+
+mort.nl
+```
+
+#### Get regional weekly mortality for 2020 and 2019
+
+```{r}
+
+areas <- GET("https://opendata.arcgis.com/datasets/e1f0dd70abcb4fceabbc43412e43ad4b_0.geojson") %>% content(as = "text") %>%
+  read_sf() %>%
+  rename(RegioS = Gemeentecode) %>% 
+  arrange(Gemeentenaam) 
+
+cur_week <- isoweek(today() - 7)
+
+is_equal_or_startswith = ~ .x == .y | str_starts(.x, paste0(.y, "\\s"))
+
+mort.weekly <- read.xlsx("https://www.cbs.nl/-/media/_excel/2020/{cur_week}/asd-tabellenset-sterfte-per-week-week24.xlsx" %>% glue(), 
+          sheet = 3, detectDates = T, startRow = 4, colNames = F) %>% t() %>% as.tibble() %>%
+  fill(`1`, .direction = "down") %>% select(-`3`) %>% set_names(c("Year", "Week", .[1,-(1:2)])) %>% .[-1,] %>%
+  gather("Gemeentenaam", "Deaths", -Year, -Week) %>%
+  group_by(Year, Gemeentenaam) %>%
+  mutate(
+    RowN = row_number(),
+    WeekN = paste0("W", str_pad(RowN, 2, pad = "0")),
+    Week = paste(Year, WeekN, sep = "-"),
+    Deaths = Deaths %>% as.numeric(),
+    Date = aweek::get_date(week = RowN, year = Year, day = 7)
+  ) %>%
+  ungroup() %>% drop_na(Deaths) %>%
+  fuzzy_left_join(areas, c("Gemeentenaam" = "Gemeentenaam"), match_fun = is_equal_or_startswith) %>% select(Date, Week, RegioS, Deaths)
+
+mort.weekly %>% filter(RegioS == "GM0345")
+```
+
+#### Interpolate monthly data pre 2019
+
+Our data interval is weekly, so we will (perhaps not completely ethic) interpolated monthly death rate to weeks.
+
+```{r}
+
+days <- data.frame(Date = seq(min(pop.all$Date), to = max(pop.all$Date), by = "days")) %>%
+  mutate(Week = ISOweek::ISOweek(Date)) %>% 
+  crossing(pop.all %>% filter(RegioS != "NL") %>% distinct(RegioS))
+
+mort.interpolated <- pop.all %>% arrange(Date) %>% 
+  filter(RegioS != "NL") %>%
+  group_by(RegioS) %>%
+  mutate(
+    DeathsAccum = cumsum(Deaths),
+  ) %>% ungroup() %>% 
+  full_join(days, c("RegioS", "Date")) %>% 
+  arrange(Date) %>%
+  group_by(RegioS) %>%
+  mutate(
+    DeathsAccumInt = approx(Date, DeathsAccum, xout=Date)$y,
+    # DeathsAccumInt = replace(na.spline(DeathsAccum), is.na(na.approx(DeathsAccum, na.rm = F)), NA),
+    Deaths2 = DeathsAccumInt - lag(DeathsAccumInt)
+  ) %>%
+  group_by(RegioS, Week) %>% summarise(
+    Date = max(Date),
+    Deaths = sum(Deaths2)
+  ) %>%
+  mutate(
+    Deaths = if_else(Deaths < 0, 0, Deaths),
+  )
+
+ggplot(mort.interpolated %>% filter(RegioS == "GM0005"), aes(Date, Deaths)) +
+  geom_line()
+```
+
+#### Bring them together
+
+```{r}
+mort <- mort.interpolated %>% full_join(mort.weekly, c("RegioS", "Week")) %>%
+  mutate(Deaths = if_else(is.na(Deaths.y), Deaths.x, Deaths.y), Date = pmax(Date.x, Date.y, na.rm = T)) %>%
+  union_all(mort.nl) %>%
+  select("RegioS", "Week", "Date", "Deaths")
+
+mort %>% filter(RegioS == "GM0345") %>% arrange(desc(Week))
+```
+### Age
+
+```{r}
+regios <- c("NL01  ", areas %>% st_drop_geometry() %>% distinct(RegioS) %>% pull(RegioS)) %>% 
+  split(cut(seq_along(.), 20, labels = F))
+
+ages <- c(seq(17000, 18400, 100), 22000) %>% as.character() %>% split(cut(seq_along(.), 3, labels = F))
+
+pop.elder.cbs <- cross2(regios, ages) %>% 
+  map(~cbs_get_data("03759ned", Geslacht = "T001038", BurgerlijkeStaat = "T001019", Leeftijd = .x[[2]], RegioS = .x[[1]])) %>%
+  bind_rows() 
+
+pop.elder <- pop.elder.cbs %>% filter(str_detect(Perioden, "\\d{4}JJ\\d{2}")) %>%
+  group_by(RegioS, Perioden) %>%
+  summarise(
+    PopElder = sum(BevolkingOp1Januari_1)
+  ) %>%
+  ungroup() %>%
+  mutate(
+    Year = str_match(Perioden, "\\d{4}") %>% as.integer(),
+    Date = date(ISOdate(Year, 1, 1)),
+    Week = ISOweek::ISOweek(Date),
+    RegioS = if_else(RegioS == "NL01  ", "NL", RegioS)
+  ) %>% select(Week, RegioS, PopElder)
+
+pop.elder %>% filter(RegioS == "NL")
+```
+
+### Get environment data
+
+```{r}
+temp <- read_rds("../results/temperature.Rds")
+air <- read_rds("../results/air.Rds")
+
+pop
+```
+
+### Join all into one dataframe
+
+All tables are being join on year and month/week. 
+Empty population data is filled from the previous months.
+
+```{r}
+data.joined <- mort %>%
+  full_join(pop, by = c("RegioS", "Week")) %>%
+  left_join(pop.elder, by = c("RegioS", "Week")) %>%
+  left_join(temp, by = c("Week", "RegioS")) %>%
+  left_join(air, by = c("Week", "RegioS")) %>%
+  group_by(RegioS) %>%
+  fill(Population, .direction = "updown")  %>%
+  fill(PopElder, .direction = "updown") %>%
+  ungroup() %>%
+  group_by(Week) %>%
+  mutate(
+    Days = (max(Date) - min(Date) + 1) %>% as.numeric(units = "days"),
+  ) %>%
+  ungroup() %>%
+  arrange(desc(Week))
+
+head(data.joined, 5)
+```
+
+### Calculate the mortality rate
+
+We will calculate the mortality rate the deaths by 1,000,000 inhabitants.
+Additionally, we'll add columns for mortality rates in the previous 8 weeks.
+
+
+```{r}
+
+data <- data.joined %>%
+  mutate(MortalityRate = Deaths * 100000 / Population, # to normalise week 53 and 1 
+         PopElder = PopElder / Population,
+         Interval = "week",
+         Period = str_match(Week, "W(\\d+)") %>% .[,2] %>% as.numeric(),
+         Year = str_match(Week, "(\\d{4})") %>% .[,2] %>% as.numeric()
+  ) %>%
+  group_by(RegioS) %>%
+  mutate(
+         "MortalityRate.-1" = lag(MortalityRate, 1, order_by = Date),
+         "MortalityRate.-2" = lag(MortalityRate, 2, order_by = Date),
+         "MortalityRate.-3" = lag(MortalityRate, 3, order_by = Date),
+         "MortalityRate.-4" = lag(MortalityRate, 4, order_by = Date),
+         "MortalityRate.-5" = lag(MortalityRate, 5, order_by = Date),
+         "MortalityRate.-6" = lag(MortalityRate, 6, order_by = Date),
+         "MortalityRate.-7" = lag(MortalityRate, 7, order_by = Date),
+         "MortalityRate.-8" = lag(MortalityRate, 8, order_by = Date),
+         "MortalityRate.-9" = lag(MortalityRate, 5, order_by = Date),
+         "MortalityRate.-10" = lag(MortalityRate, 6, order_by = Date),
+         "MortalityRate.-11" = lag(MortalityRate, 7, order_by = Date),
+         "MortalityRate.-12" = lag(MortalityRate, 8, order_by = Date),
+        ) %>%
+  ungroup() %>%
+  select(-Days)
+data %>% filter(RegioS == "GM0345") %>% arrange(Week)
+```
+
+### Save data
+
+```{r}
+write_rds(data, "../results/data.Rds")
+```
+
+
