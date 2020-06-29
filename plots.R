@@ -13,12 +13,12 @@ data.labels = data.frame(
   ),
   "Label" = c(
     "Average Mortality",
-    "Expected Mortality",
+    "Expected Mortality **",
     "Coronavirus (2020)",
     "Flu Epidemic (2018)",
     "Reported by RIVM",
     "Above average",
-    "Unexpected",
+    "Unexpected **",
     "Deaths (any cause)",
     "Year highest mortality"
   )
@@ -43,8 +43,7 @@ regions = data.mort_spatial %>% select(Name = Gemeentenaam, Regio = RegioS) %>%
 renderPlotMortOverTime <- function(input) {
   output <- renderPlotly({ 
     x <- data.mort_over_time %>% filter(Regio == input$region)
-    interval = x %>% pull("Interval") %>% first()
-    
+
     if (x %>% count() == 0) return()
     
     tooltip <- ("<b>{Date}</b>
@@ -62,7 +61,7 @@ Deaths: {floor(Absolute)}"
     ) +
       geom_point(aes(x = Date, y = Value)) +
       geom_line(aes(x = Date, y = Interpolated, text = NULL)) +
-      labs(x = "Period ({interval})" %>% glue(), y = "Deaths by 100.000 inhabitants") +
+      labs(x = "Date" %>% glue(), y = "Deaths by 100.000 inhabitants") +
       theme_minimal() +
       theme(legend.title = element_blank())
     ) 
@@ -77,7 +76,6 @@ renderPlotExcessiveMortOverTime <- function(input) {
     
     if (x %>% count() == 0) return()
     
-    interval <- x %>% pull("Interval") %>% first()
     tooltip <- ("<b>{Date}</b>
 Deaths: {floor(Value)}")
     
@@ -91,7 +89,7 @@ Deaths: {floor(Value)}")
     ) +
       geom_point(aes(x = Date, y = Value)) +
       geom_line(aes(x = Date, y = Interpolated, text = NULL)) +
-      labs(x = "Period ({interval})" %>% glue(), y = "Absolute deaths") +
+      labs(x = "Date" %>% glue(), y = "Absolute deaths") +
       theme_minimal() +
       theme(legend.title = element_blank()) +
       scale_color_brewer(palette = "Set2")
@@ -107,9 +105,13 @@ renderTableSummary <- function(input) {
 
   output <- renderTable({
     data.summary %>% filter(Regio == input$region) %>%
-      mutate(Value = num_format(Value)) %>%
-      left_join(data.labels) %>% select(-Variable) %>%
-      spread(Label, Value) 
+      mutate(
+        `Deaths (any cause)` = num_format(Deaths),
+        `Above avg` = num_format(DeathsAboveAvg),
+        `Unexpected**` = num_format(DeathsUnexpected), 
+        `Reported by RIVM` = num_format(Rivm),
+        `Year highest mortality` = YearHighestMort %>% as.character()
+      ) %>% select(-Deaths, -DeathsAboveAvg, -DeathsUnexpected, -Rivm, -YearHighestMort)
   })
 
   
@@ -120,7 +122,8 @@ renderMapAreas <- function(input) {
   pal <- colorNumeric(
     palette = "YlOrRd", domain = data.mort_spatial$MortalityRate)
   
-  x2 <- data.mort_spatial %>% filter(Period == max(data.mort_spatial$Period))
+  last_week <- data.mort_spatial %>% drop_na(MortalityRate) %>% pull(Period) %>% max()
+  x2 <- data.mort_spatial %>% filter(Period == last_week)
   
   output <- renderLeaflet({
     labels <- "<strong>{x2$Gemeentenaam}</strong>" %>% glue() %>% lapply(htmltools::HTML)

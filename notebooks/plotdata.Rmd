@@ -20,7 +20,6 @@ cols <- c(
   "Date",
   "Regio",
   "Period",
-  "Interval",
   "Population",
   "Deaths",
   "MortalityRate")
@@ -35,10 +34,7 @@ cols.historic <-
     "Year"
   )
 
-data.historic <- union_all(
-  read_rds("../results/data.Rds") %>% select(cols.historic),
-  read_rds("../results/data.spatial.Rds") %>% select(cols.historic, "RegioS") %>% mutate("Regio" = RegioS) %>% select(-"RegioS"),
-)
+data.historic <- read_rds("../results/data.Rds") %>% rename(Regio = RegioS) %>% select(cols.historic)
 
 # data.flu2018 <- data.historic %>% 
 #   filter(Year == 2018 | Year == 2017) %>% 
@@ -69,15 +65,11 @@ cols.corona <-
     "ExpectedMortality", "AvgMortality", "UnexpectedMortality", "ExcessiveMortality", "Flu2018"
   )
 
-data.corona <- union_all(
-  readRDS("../results/data.corona.Rds") %>% select(cols.corona),
-  readRDS("../results/data.spatial.corona.Rds") %>% select(cols.corona, "RegioS") %>% mutate("Regio" = RegioS) %>% select(-RegioS)
-) %>% 
-  # left_join(data.flu2018, by = c("Period", "Regio")) %>%
-  full_join(data.rivm, by = c("Regio", "Date")) %>%
+data.corona <- read_rds("../results/data.corona.Rds") %>% rename(Regio = RegioS) %>% select(cols.corona) %>%
+  full_join(data.rivm, by = c("Regio", "Date", "Period")) %>%
   drop_na(Date)
 
-data.corona %>% filter(Regio == "NL")
+data.corona %>% filter(Regio == "NL") %>% arrange(Date)
 ```
 
 ### Geographical entities
@@ -98,9 +90,9 @@ write_rds(areas, "../results/plots/areas.Rds")
 dates <- data.corona %>% drop_na("Period", "Date") %>% distinct(Date) %>% pull("Date")
 fields <- c("MortalityRate", "ExpectedMortality", "AvgMortality", "Flu2018", "DeathsUnexpected", "DeathsAboveAvg", "Rivm", "Deaths")
 days <- data.frame(Date = seq(min(dates), to = max(dates), by = "days")) %>%
-  crossing(data.corona %>% select(Regio, Interval) %>% distinct()) %>%
+  crossing(data.corona %>% select(Regio) %>% distinct()) %>%
   crossing(fields) %>%
-  set_names(c("Date", "Regio", "Interval", "Variable"))
+  set_names(c("Date", "Regio", "Variable"))
 
 data.mort <- data.corona %>% 
   mutate(
@@ -110,23 +102,17 @@ data.mort <- data.corona %>%
   gather("Variable", "Value", fields) %>%
   drop_na(Regio, Variable, Date) %>%
   full_join(days) %>%
-  group_by(Regio, Interval, Variable) %>%
+  group_by(Regio, Variable) %>%
   filter(sum(!is.na(Value)) > 0) %>%
-  # Add dates of first and last observation to only interpolate.
-  mutate(
-    Date2 = if_else(is.na(Value), as.Date(NA), Date),
-    MinDate = min(Date2, na.rm = T),
-    MaxDate = max(Date2, na.rm = T)
-  ) %>%
-  filter(Date >= MinDate & Date <= MaxDate) %>%
+  # summarise(n = n()) %>% arrange(n)
   mutate(
     Interpolated = approx(Date, Value, xout=Date)$y,
     Absolute = if_else(Variable == "MortalityRate", Value * Population / 100000, as.double(NA))
   ) %>%
   ungroup() %>%
-  select("Regio", "Date", "Period", "Interval", "Variable", "Value", "Interpolated", "Absolute")
+  select("Regio", "Date", "Period", "Variable", "Value", "Interpolated", "Absolute")
 
-data.mort %>% filter(Regio == "NL", Variable == "Rivm") %>% arrange(Date)
+data.mort %>% filter(Regio == "NL") %>% arrange(Date)
 
 write_rds(data.mort, "../results/plots/mortovertime.Rds")
 ```
@@ -136,11 +122,11 @@ write_rds(data.mort, "../results/plots/mortovertime.Rds")
 ```{r purl=F}
 x <- data.mort %>%
   filter(Variable %in% c("MortalityRate", "ExpectedMortality", "AvgMortality", "Flu2018")) %>%
-  filter(Regio == "NL")
+  filter(Regio == "GM0345")
 
 tooltip <- ("<b>{Date}</b>
 Mortality rate: {floor(Value)}
-{Deaths: {floor(Absolute)}"
+Deaths: {floor(Absolute)}"
 )
 
 ggplotly(tooltip = "text", ggplot(
@@ -192,7 +178,7 @@ ggplotly(ggplot(
 ### Spatial dataset
 
 ```{r}
-data.spatial_absolute <- areas %>% left_join(data.corona %>% filter(Interval == "month"), by = c("RegioS" = "Regio")) %>% 
+data.spatial_absolute <- areas %>% left_join(data.corona, by = c("RegioS" = "Regio")) %>% 
     mutate(
       ActualMortality = round(MortalityRate * Population / 100000),
       ExpectedMortality = round(ExpectedMortality * Population / 100000),
@@ -219,19 +205,24 @@ tm_shape(data.spatial_absolute %>% filter(Period == 4)) +
 ```{r}
 year_high_mort <- data.historic %>% group_by(Regio, Year) %>% 
   summarise(MortalityRate = mean(MortalityRate)) %>% 
-  arrange(desc(MortalityRate)) %>% mutate(Variable = "YearHighestMort", Value = Year %>% as.character()) %>% 
-  select(Variable, Value, Regio) %>%
-  slice(1)
+  arrange(desc(MortalityRate)) %>%
+  slice(1) %>% arrange(Regio) %>% ungroup() %>%
+  select(YearHighestMort = Year, Regio)
 
 data.summary <- data.mort %>% 
       filter(Period > 0 & Variable %in% c("Deaths", "Rivm", "DeathsAboveAvg", "DeathsUnexpected")) %>%
-      union_all(year_high_mort) %>%
       group_by(Regio, Variable) %>%
-      summarise(Value = ceiling(sum(Value, na.rm = T))) %>%
-      ungroup()
+      summarise(Value = floor(sum(Value, na.rm = T))) %>%
+      spread(Variable, Value) %>%
+      ungroup() %>%
+      left_join(year_high_mort)
+
 
 write_rds(data.summary, "../results/plots/summary.Rds")
 
-data.summary %>% filter(Regio == "GM0345") %>% spread(Variable, Value)
+data.mort %>% 
+  filter(Regio == "GM0345" & Variable %in% c("Rivm")) %>% arrange(Date) %>% 
+  group_by(Regio, Variable) %>% summarise(Value = sum(Value, na.rm = T)) %>% spread(Variable, Value)
+data.summary %>% filter(Regio == "GM0345")
 ```
 

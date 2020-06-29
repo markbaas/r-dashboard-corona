@@ -33,6 +33,7 @@ dashboardTab <- tabPanel("Dashboard",
                
                uiOutput("title.table.sums"), 
                tableOutput("table.sums"),
+               tags$small("** The (un)expected mortality is calculated using linear regression using environment variables such as temperature, air polution and age.")
                
         ),
         column(width = 4,
@@ -52,24 +53,20 @@ shinyUI(
             "----",
             "Data",
             tabPanel(
-                "Netherlands",
-                notebookPage("notebooks/data.nb.html")
-            ),
-            tabPanel(
-                "Regions",
-                notebookPage("notebooks/data.spatial.nb.html")
-            ),
-            tabPanel(
-                "Air data",
+                "Air",
                 notebookPage("notebooks/dataproviders/air.nb.html")
             ),
             tabPanel(
-                "Temperature data",
+                "Temperature",
                 notebookPage("notebooks/dataproviders/temperature.nb.html")
             ),
             tabPanel(
                 "RIVM",
                 notebookPage("notebooks/dataproviders/rivm.nb.html")
+            ),
+            tabPanel(
+                "Data",
+                notebookPage("notebooks/data.nb.html")
             ),
             "----",
             "Training & predicting",

@@ -1,9 +1,6 @@
 ---
 title: "Add predictions"
 output: html_notebook
-params:
-  data: "data"
-  # data: "data.spatial"
 ---
 
 ```{r message=FALSE, warning=FALSE}
@@ -20,19 +17,6 @@ model <- read_rds("../results/model.Rds" %>% glue())
 
 model$GM
 ```
-Add lat lon to data
-
-```{r}
-areas <- GET("https://opendata.arcgis.com/datasets/e1f0dd70abcb4fceabbc43412e43ad4b_0.geojson") %>% content(as = "text") %>%
-  read_sf() %>%
-  rename(RegioS = Gemeentecode) %>% 
-  arrange(Gemeentenaam) %>% mutate(
-    Center = st_centroid(geometry),
-    Lon = st_coordinates(Center)[,"X"],
-    Lat = st_coordinates(Center)[, "Y"]
-  ) %>% st_drop_geometry() %>% select("RegioS", "Lon", "Lat") 
-
-```
 
 ###  Plot different years/categories
 
@@ -44,7 +28,7 @@ data_avg <- data %>%
   union_all(data %>% arrange(Date) %>% filter(Year <= 2019) %>% filter(Period == max(Period)) %>% mutate(Period = 0)) %>%
   group_by(RegioS, Period) %>%
   summarise(
-    AvgMortality = mean(MortalityRate)
+    AvgMortality = mean(MortalityRate, na.rm = T)
   ) %>% select(RegioS, Period, AvgMortality)
 
 
@@ -56,7 +40,23 @@ data_cur.nl <- data_cur.all %>% filter(RegioS == "NL") %>%
   mutate(
     ExpectedMortality = predict(model$NL, .),
     UnexpectedMortality = MortalityRate - ExpectedMortality,
-  )  %>% filter(RegioS == "NL")
+  )
+
+data_cur.gm <- data_cur.all %>%
+  drop_na() %>%
+  mutate(
+    ExpectedMortality = predict(model$GM, .),
+    UnexpectedMortality = MortalityRate - ExpectedMortality,
+  )
+
+# data_cur <- union_all(data_cur.gm, data_cur.nl)
+data_cur <- data %>% filter(Year == 2020) %>% 
+  union_all(data %>% filter(Year == 2019) %>% filter(Period == max(Period)) %>% mutate(Period = 0)) %>%
+  drop_na() %>%
+  mutate(
+    ExpectedMortality = if_else(RegioS == "NL", predict(model$NL, .), predict(model$GM, .)),
+    UnexpectedMortality = MortalityRate - ExpectedMortality,
+  )
 
 data_infl <- data %>%
   filter(year(Date) == 2018) %>%
@@ -75,12 +75,12 @@ data.corona <- data_cur %>%
   )
 
 pdata <- data.corona %>% filter(RegioS == "NL") %>%
-  gather(MortalityRate, Value, ExpectedMortality, AvgMortality, Flu2018, MortalityRate)
+  gather(MortalityRate, Value, ExpectedMortality, AvgMortality, Flu2018, MortalityRate) %>% arrange(Date)
 
 
 ggplot(data=pdata, aes(x = Date, y = Value, group = MortalityRate, color = MortalityRate)) +
   geom_line(aes(y = Value, group = MortalityRate, color = MortalityRate)) +
-  labs(x = "Periode", y = "Doden per miljoen inwoners")
+  labs(x = "Periode", y = "Doden per 100,000 inwoners")
 ```
 
 ```{r purl=FALSE}
@@ -106,5 +106,5 @@ data.summary
 ```
 
 ```{r include=FALSE}
-write_rds(data.corona, "../results/{params$data}.corona.Rds" %>% glue())
+write_rds(data.corona, "../results/data.corona.Rds" %>% glue())
 ```

@@ -71,7 +71,9 @@ data.rivm.spatial %>% filter(Regio == "GM0345")
 ### Join datasets
 
 ```{r}
-data.rivm <- union_all(data.rivm.nl, data.rivm.spatial)
+data.rivm <- union_all(data.rivm.nl, data.rivm.spatial) %>% mutate(
+  Period = isoweek(Date)
+)
 
 write_rds(data.rivm, "../../results/rivm.Rds")
 ```
